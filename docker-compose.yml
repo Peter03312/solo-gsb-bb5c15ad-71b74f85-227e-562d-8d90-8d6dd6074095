@@ -1,0 +1,22 @@
+services:
+  tide-api:
+    build: .
+    image: tide-window-api:latest
+    container_name: tide-window-api
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite database file inside the container (mounted as a volume).
+      TIDE_DB_PATH: /data/tide.db
+    volumes:
+      - tide-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  tide-data:
