@@ -13,6 +13,115 @@
 计算以**异步任务**方式执行：先创建任务拿到 ID，再按 ID 轮询结果；任务状态与
 结果持久化在 SQLite 中（容器启动时自动建库建表）。
 
+另提供**同步**接口 `POST /sample-quality`：在计算通航窗口前审计潮位样本，
+返回断链区段、查询范围覆盖缺口与突变异常样本（只报告、不修正），详见下文。
+
+## 样本质量审计（`POST /sample-quality`）
+
+在创建计算任务之前，可以先对潮位样本做一次**同步审计**（不建任务、不落库，
+直接返回结果），提前发现会导致 `unknown` 区段或结果失真的数据问题：
+
+- **断链识别**：按时间顺序找出相邻间隔超过 `max_gap_seconds` 的样本对——与
+  窗口计算完全相同的切链规则；`gaps[]` 裁剪到查询范围、按时间排序，
+  **首尾相接且原因相同**的段合并为一段；
+- **覆盖缺口**：`query_start` 早于首个样本 / `query_end` 晚于末个样本的部分
+  以 `reason = no_sample_coverage` 列入 `gaps[]`，并在 `coverage` 与 `notes`
+  中明确说明（不做外推）；
+- **突变异常**：在每条连续链内计算相邻斜率（米/秒），以链内**中位数与
+  MAD**（中位数绝对偏差）构造稳健 Z 分数 `0.6745 × |斜率 − 中位数| / MAD`，
+  超过 `spike_z_threshold`（默认 3.5）的斜率记为离群；某样本**两侧**斜率均
+  离群时才标记为突变异常——单侧离群只是台阶式水位变化，不标记；链端点只有
+  单侧斜率，永不标记。MAD 为 0 时任何偏离中位数的斜率都算离群，此时
+  `robust_z` 为 `null`。链内样本少于 3 个时不做突变判定。
+- **异常点只报告、绝不修正**：`anomalies[]` 原样带回入参的 `time` 与
+  `height_m`，不做插值替换、平滑或剔除；是否剔除/重测由调用方决定。
+
+`overall_status`：无断链、无覆盖缺口且无突变异常时为 `ok`，否则为 `warn`。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `samples` | 数组（≥2） | 潮位样本，按 UTC 时间**严格递增**：`{"time", "height_m"}` |
+| `query_start` / `query_end` | datetime | 查询起止时间（UTC）；断链段裁剪到该范围，范围外的样本端点形成覆盖缺口 |
+| `max_gap_seconds` | number > 0 | 相邻样本最大允许间隔（秒），超过则判为断链 |
+| `spike_z_threshold` | number > 0，可选 | 突变判定的稳健 Z 分数阈值，默认 `3.5` |
+
+```bash
+curl -X POST http://localhost:8000/sample-quality \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "samples": [
+      {"time": "2026-09-21T00:00:00Z", "height_m": 2.0},
+      {"time": "2026-09-21T01:00:00Z", "height_m": 2.8},
+      {"time": "2026-09-21T02:00:00Z", "height_m": 3.4},
+      {"time": "2026-09-21T03:00:00Z", "height_m": 3.8},
+      {"time": "2026-09-21T04:00:00Z", "height_m": 9.5},
+      {"time": "2026-09-21T05:00:00Z", "height_m": 4.0},
+      {"time": "2026-09-21T06:00:00Z", "height_m": 3.6},
+      {"time": "2026-09-21T07:00:00Z", "height_m": 3.0},
+      {"time": "2026-09-21T08:00:00Z", "height_m": 2.4},
+      {"time": "2026-09-21T09:00:00Z", "height_m": 2.0}
+    ],
+    "query_start": "2026-09-21T00:00:00Z",
+    "query_end":   "2026-09-21T09:00:00Z",
+    "max_gap_seconds": 3700
+  }'
+```
+
+上面请求中 04:00 的 9.5 m 是孤立突点（两侧斜率 ±5.7/−5.5 m·h⁻¹ 均显著偏离
+链内中位数），响应（真实结果）：
+
+```json
+{
+  "overall_status": "warn",
+  "sample_count": 10,
+  "chain_count": 1,
+  "max_gap_seconds": 3700.0,
+  "spike_z_threshold": 3.5,
+  "gaps": [],
+  "anomalous_indices": [4],
+  "anomalies": [
+    {
+      "index": 4,
+      "time": "2026-09-21T04:00:00Z",
+      "height_m": 9.5,
+      "chain_index": 0,
+      "robust_z": 4.3,
+      "slope_in_m_per_s": 0.0015833333333333333,
+      "slope_out_m_per_s": -0.0015277777777777779,
+      "median_slope_m_per_s": -0.00011111111111111109,
+      "mad_slope_m_per_s": 0.00022222222222222218
+    }
+  ],
+  "coverage": {
+    "first_sample_time": "2026-09-21T00:00:00Z",
+    "last_sample_time": "2026-09-21T09:00:00Z",
+    "query_start_covered": true,
+    "query_end_covered": true,
+    "leading_gap_seconds": 0.0,
+    "trailing_gap_seconds": 0.0
+  },
+  "notes": ["标记 1 个突变异常样本（索引见 anomalous_indices）；异常点仅报告，不做任何修正"]
+}
+```
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `overall_status` | `ok` / `warn` |
+| `sample_count` / `chain_count` | 样本总数 / 按 `max_gap_seconds` 切出的连续链数量 |
+| `gaps[]` | 查询范围内的断链/覆盖缺口：`start`、`end`、`reason`（`sample_gap_exceeds_max_gap` / `no_sample_coverage`）、`duration_seconds`；按时间排序，首尾相接且同因的段已合并 |
+| `anomalous_indices` | 突变异常样本在请求 `samples` 中的下标（升序） |
+| `anomalies[]` | 异常明细：下标、原始时间/潮高、所在链编号、两侧斜率、链内中位数与 MAD、`robust_z`（两侧稳健 Z 分数的较小者，MAD 为 0 时为 `null`） |
+| `coverage` | 首末样本时间、`query_start`/`query_end` 是否被样本覆盖、两端缺口秒数 |
+| `notes` | 人类可读的结论说明（含 query_start/query_end 覆盖缺口） |
+
+校验失败（样本未严格递增、`query_end` 不晚于 `query_start`、
+`max_gap_seconds`/`spike_z_threshold` 非正数或非有限值、潮高为 NaN 等）
+统一返回 `422` 并指明字段与原因。
+
 ## 船队协同任务（`POST /fleet-tasks`）
 
 单船之外，还可以一次性提交**一队船舶**（各自的名称、吃水、富余水深、航程时长），
@@ -275,12 +384,13 @@ curl -X POST http://localhost:8000/tasks \
 
 ```
 app/
-  main.py            # FastAPI 路由、单船/船队任务创建/查询、后台计算
+  main.py            # FastAPI 路由、样本质量审计、单船/船队任务创建/查询、后台计算
   schemas.py         # 请求/响应模型与输入校验
   config.py          # 配置（TIDE_DB_PATH 等）
   db.py              # SQLite 连接与启动建表（tasks / fleet_tasks）
   services/tides.py  # PCHIP 插值、求根、窗口与 unknown 计算
   services/fleet.py  # 船队协同：各船窗口、公共出发区间与排除归因
+  services/quality.py# 样本质量审计：断链识别、覆盖缺口、中位数/MAD 突变标记
   tests/             # pytest：算法单测 + 接口端到端测试
 Dockerfile           # 依赖安装于构建阶段
 docker-compose.yml   # 一条命令启动，含卷持久化与健康检查

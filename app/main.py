@@ -19,10 +19,13 @@ from app.schemas import (
     FleetTaskOut,
     FleetTaskRequest,
     ResultOut,
+    SampleQualityOut,
+    SampleQualityRequest,
     TaskOut,
     WindowRequest,
 )
 from app.services.fleet import FleetShip, compute_fleet_windows
+from app.services.quality import REASON_GAP, QualityResult, audit_sample_quality
 from app.services.tides import compute_navigation_windows
 
 
@@ -163,6 +166,74 @@ def root() -> RedirectResponse:
 def health(conn: sqlite3.Connection = Depends(get_db)) -> dict:
     conn.execute("SELECT 1")
     return {"status": "ok"}
+
+
+def _quality_notes(result: QualityResult) -> list[str]:
+    """Human-readable summary, incl. the query-boundary coverage shortfall."""
+    notes: list[str] = []
+    if not result.query_start_covered:
+        notes.append(
+            "query_start 早于首个样本，查询开头 "
+            f"{result.leading_gap_seconds:.0f} 秒无样本覆盖（不做外推）"
+        )
+    if not result.query_end_covered:
+        notes.append(
+            "query_end 晚于末个样本，查询末尾 "
+            f"{result.trailing_gap_seconds:.0f} 秒无样本覆盖（不做外推）"
+        )
+    n_breaks = sum(1 for g in result.gaps if g.reason == REASON_GAP)
+    if n_breaks:
+        notes.append(
+            f"发现 {n_breaks} 段相邻样本间隔超过 max_gap_seconds 的断链区段，"
+            "计算通航窗口时这些区段禁止插值"
+        )
+    if result.anomalies:
+        notes.append(
+            f"标记 {len(result.anomalies)} 个突变异常样本"
+            "（索引见 anomalous_indices）；异常点仅报告，不做任何修正"
+        )
+    if not notes:
+        notes.append("样本链完整覆盖查询范围，未发现断链或突变异常")
+    return notes
+
+
+@app.post(
+    "/sample-quality",
+    response_model=SampleQualityOut,
+    tags=["质量审计"],
+    summary="计算通航窗口前审计潮位样本质量",
+)
+def sample_quality(req: SampleQualityRequest) -> SampleQualityOut:
+    """Synchronous audit (no task, no persistence): chain breaks, query-range
+    coverage gaps and spike anomalies.  Flagged samples are reported as-is —
+    never corrected, smoothed or removed."""
+    result = audit_sample_quality(
+        sample_times=[s.time for s in req.samples],
+        sample_heights=[s.height_m for s in req.samples],
+        query_start=req.query_start,
+        query_end=req.query_end,
+        max_gap_seconds=req.max_gap_seconds,
+        spike_z_threshold=req.spike_z_threshold,
+    )
+    return SampleQualityOut(
+        overall_status=result.overall_status,
+        sample_count=len(req.samples),
+        chain_count=result.chain_count,
+        max_gap_seconds=req.max_gap_seconds,
+        spike_z_threshold=req.spike_z_threshold,
+        gaps=[vars(g) for g in result.gaps],
+        anomalous_indices=[a.index for a in result.anomalies],
+        anomalies=[vars(a) for a in result.anomalies],
+        coverage={
+            "first_sample_time": req.samples[0].time,
+            "last_sample_time": req.samples[-1].time,
+            "query_start_covered": result.query_start_covered,
+            "query_end_covered": result.query_end_covered,
+            "leading_gap_seconds": result.leading_gap_seconds,
+            "trailing_gap_seconds": result.trailing_gap_seconds,
+        },
+        notes=_quality_notes(result),
+    )
 
 
 @app.post(
