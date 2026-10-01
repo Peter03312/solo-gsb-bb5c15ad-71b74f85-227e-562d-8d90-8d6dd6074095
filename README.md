@@ -81,6 +81,77 @@ curl -X POST http://localhost:8000/fleet-tasks \
 校验失败（船队为空、船名重复或为空白、缺少航程、吃水为负、样本未严格递增、
 封航区间 end 不晚于 start 等）统一返回 `422` 并指明字段与原因。
 
+## 样本质量审计（`POST /sample-quality`）
+
+在创建通航窗口任务**之前**，可以先用本接口**同步审计**一组潮位样本（不落库、
+不创建任务，`200` 直接返回审计结果）。审计做两件事：
+
+1. **断链识别**：按时间顺序检查相邻样本间隔，严格**超过** `max_gap_seconds`
+   的间隔记为断链；孤立样本两侧的两个断链在该样本时刻相接，会**合并为一个**
+   gap。响应中的 `gaps[]` 按时间排序、相邻相接的断链已合并，每段给出
+   `start`（前一条链的最后样本时刻）、`end`（后一条链的首个样本时刻）、
+   `duration_seconds`，以及它与查询区间的交集 `query_overlap`（无正长度交集时
+   为 `null`）。
+2. **突变异常标记**：在每个连续链内部，对相邻斜率
+   `(h[i+1]-h[i])/(t[i+1]-t[i])` 用链内斜率的**中位数与 MAD**（中位数绝对偏差，
+   乘 1.4826）计算稳健 z 分数，`|z| ≥ 3.5` 的斜率视为离群；只有当一个内部样本
+   **前后两条相邻斜率都离群**（尖锐突升/突降，既异常进入又异常退出）时，才把该
+   样本标记为突变异常。这样单次阶跃（如仪器零点重置）不会把旁边的正常样本误判
+   为异常。MAD 退化为 0 时（如平台型合成数据），与中位数不同的斜率直接判为
+   离群，对应 z 分数以 `null` 返回；完全等斜率的链永远不会被标记。
+   链长过短（斜率样本太少，如 ≤4 条）时 MAD 估计不稳健，个别明显突变可能
+   达不到 `|z| ≥ 3.5` 的阈值；审计前请保留足够的连续样本。
+
+**异常点不会被静默修正或剔除**：`anomalies[]` 原样返回异常样本在请求数组中的
+**下标**（`index`，从 0 开始）、时间、原始潮高、所在链序号 `chain_index` 及
+前后斜率与 z 分数，由调用方自行决定如何处理。
+
+`query_start` / `query_end` 用于说明查询区间如何被缺口覆盖：
+
+- `uncovered[]` 按时间排序列出查询区间内**无法插值**的区段：落在断链内的部分
+  原因为 `sample_gap_exceeds_max_gap`，超出全部样本覆盖范围（首样本之前 /
+  末样本之后）的部分原因为 `no_sample_coverage`；
+- `covered_seconds` / `uncovered_seconds` 分别给出查询区间内被连续链覆盖与
+  未覆盖的总秒数；
+- `overall_status`：无异常且查询区间被完全覆盖时为 `ok`，否则（存在突变异常，
+  或查询区间有任何未覆盖区段）为 `warn`。注意：查询区间之外的断链仍会出现在
+  `gaps[]` 中，但其 `query_overlap` 为 `null`，不触发 `warn`。
+
+请求体（校验规则与 `/tasks` 的同名字段一致）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `samples` | 数组（≥2） | 待审计潮位样本，按 UTC 时间**严格递增**：`{"time", "height_m"}`；潮高不接受 NaN/无穷 |
+| `query_start` / `query_end` | datetime | 查询起止时间（UTC，end 必须晚于 start），用于标注覆盖缺口 |
+| `max_gap_seconds` | number > 0 | 相邻样本最大允许间隔（秒），超过即记为断链 |
+
+```bash
+curl -X POST http://localhost:8000/sample-quality \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "samples": [
+      {"time": "2026-09-21T00:00:00Z", "height_m": 8.0},
+      {"time": "2026-09-21T01:00:00Z", "height_m": 8.0},
+      {"time": "2026-09-21T05:00:00Z", "height_m": 8.0},
+      {"time": "2026-09-21T10:00:00Z", "height_m": 8.0},
+      {"time": "2026-09-21T11:00:00Z", "height_m": 8.0}
+    ],
+    "query_start": "2026-09-21T00:00:00Z",
+    "query_end":   "2026-09-21T11:00:00Z",
+    "max_gap_seconds": 3700
+  }'
+```
+
+上面的样本在 01:00→05:00 与 05:00→10:00 两处断链，中间 05:00 是孤立样本，
+两段断链相接合并为一个 `01:00–10:00` 的 gap（9 小时）；`uncovered[]` 为
+`01:00–10:00`（`sample_gap_exceeds_max_gap`），覆盖 2 小时 / 未覆盖 9 小时，
+`overall_status = "warn"`。
+
+校验失败（样本少于 2 个、时间未严格递增、`query_end` 不晚于 `query_start`、
+`max_gap_seconds ≤ 0`、潮高为 NaN 等）统一返回 `422` 并指明字段与原因。
+本接口为只读同步接口，不写入 SQLite，也不影响 `/tasks` 与 `/fleet-tasks` 的
+任何行为。
+
 ## 一条命令启动
 
 前置条件：已安装 Docker 与 Docker Compose 插件（v2）。
@@ -275,12 +346,13 @@ curl -X POST http://localhost:8000/tasks \
 
 ```
 app/
-  main.py            # FastAPI 路由、单船/船队任务创建/查询、后台计算
+  main.py            # FastAPI 路由：样本审计、单船/船队任务创建/查询、后台计算
   schemas.py         # 请求/响应模型与输入校验
   config.py          # 配置（TIDE_DB_PATH 等）
   db.py              # SQLite 连接与启动建表（tasks / fleet_tasks）
   services/tides.py  # PCHIP 插值、求根、窗口与 unknown 计算
   services/fleet.py  # 船队协同：各船窗口、公共出发区间与排除归因
+  services/quality.py# 样本审计：断链合并与斜率中位数/MAD 突变标记
   tests/             # pytest：算法单测 + 接口端到端测试
 Dockerfile           # 依赖安装于构建阶段
 docker-compose.yml   # 一条命令启动，含卷持久化与健康检查

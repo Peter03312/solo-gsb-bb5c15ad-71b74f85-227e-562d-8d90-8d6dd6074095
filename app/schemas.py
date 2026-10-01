@@ -228,6 +228,59 @@ class FleetTaskRequest(BaseModel):
         return self
 
 
+class SampleQualityRequest(BaseModel):
+    """Request for POST /sample-quality: audit samples before computing."""
+
+    samples: list[TideSample] = Field(
+        ..., min_length=2, description="按 UTC 递增的潮位样本（审计不会修改样本）"
+    )
+    query_start: datetime = Field(..., description="查询起始时间（UTC），用于说明覆盖缺口")
+    query_end: datetime = Field(..., description="查询结束时间（UTC），用于说明覆盖缺口")
+    max_gap_seconds: float = Field(
+        ..., gt=0, description="相邻样本最大允许间隔（秒），超过即记为断链"
+    )
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "samples": [
+                {"time": "2026-09-21T00:00:00Z", "height_m": 1.0},
+                {"time": "2026-09-21T01:00:00Z", "height_m": 3.0},
+                {"time": "2026-09-21T02:00:00Z", "height_m": 6.0},
+                {"time": "2026-09-21T03:00:00Z", "height_m": 8.0},
+                {"time": "2026-09-21T04:00:00Z", "height_m": 8.0},
+                {"time": "2026-09-21T05:00:00Z", "height_m": 6.0},
+                {"time": "2026-09-21T06:00:00Z", "height_m": 3.0},
+                {"time": "2026-09-21T07:00:00Z", "height_m": 1.0},
+            ],
+            "query_start": "2026-09-21T00:00:00Z",
+            "query_end": "2026-09-21T07:00:00Z",
+            "max_gap_seconds": 3700,
+        }
+    })
+
+    @model_validator(mode="after")
+    def _validate(self) -> "SampleQualityRequest":
+        # Naive datetimes are interpreted as UTC before any comparison.
+        epochs = [to_epoch(s.time) for s in self.samples]
+        qs = to_epoch(self.query_start)
+        qe = to_epoch(self.query_end)
+
+        for i in range(1, len(epochs)):
+            if epochs[i] <= epochs[i - 1]:
+                raise ValueError("samples.time 必须严格按 UTC 递增")
+        if qe <= qs:
+            raise ValueError("query_end 必须晚于 query_start")
+        if self.max_gap_seconds != self.max_gap_seconds or \
+                self.max_gap_seconds in (float("inf"), float("-inf")):
+            raise ValueError("max_gap_seconds 必须为有限数值")
+        for i, s in enumerate(self.samples):
+            if s.height_m != s.height_m:
+                raise ValueError(f"samples[{i}].height_m 不能为 NaN")
+            if s.height_m in (float("inf"), float("-inf")):
+                raise ValueError(f"samples[{i}].height_m 必须为有限数值")
+        return self
+
+
 class WindowOut(BaseModel):
     start: UtcZ
     end: UtcZ
@@ -312,3 +365,88 @@ class FleetTaskOut(BaseModel):
     request: FleetTaskRequest
     result: FleetResultOut | None = None
     error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# POST /sample-quality
+# ---------------------------------------------------------------------------
+
+
+class GapQueryOverlapOut(BaseModel):
+    """One gap's intersection with the audited query range."""
+
+    start: UtcZ
+    end: UtcZ
+    duration_seconds: float
+
+
+class GapOut(BaseModel):
+    """One merged sampling gap (open between the two chains' edge samples)."""
+
+    start: UtcZ = Field(..., description="断链前最后一个样本的时间")
+    end: UtcZ = Field(..., description="断链后第一个样本的时间")
+    duration_seconds: float
+    query_overlap: GapQueryOverlapOut | None = Field(
+        ..., description="该 gap 与 [query_start, query_end] 的交集；无交集为 null"
+    )
+
+
+class SampleAnomalyOut(BaseModel):
+    """One flagged jump anomaly; the sample is reported, never corrected."""
+
+    index: int = Field(..., description="异常样本在请求 samples 中的下标（从 0 开始）")
+    time: UtcZ
+    height_m: float = Field(..., description="原始潮高（米），不做任何修正")
+    chain_index: int = Field(..., description="异常所在连续链的序号（从 0 开始）")
+    slope_before: float = Field(..., description="异常点与前一相邻样本的斜率（米/秒）")
+    slope_after: float = Field(..., description="异常点与后一相邻样本的斜率（米/秒）")
+    z_before: float | None = Field(
+        ..., description="前一斜率的稳健 z 分数（|z|≥3.5 视为离群）；离散退化时为 null"
+    )
+    z_after: float | None = Field(
+        ..., description="后一斜率的稳健 z 分数；离散退化时为 null"
+    )
+
+
+class UncoveredOut(BaseModel):
+    """Part of the query range not covered by valid sample chains."""
+
+    start: UtcZ
+    end: UtcZ
+    reason: str = Field(
+        ...,
+        description=(
+            "sample_gap_exceeds_max_gap（query 覆盖到断链缺口）或 "
+            "no_sample_coverage（query 超出全部样本覆盖区间）"
+        ),
+    )
+    duration_seconds: float
+
+
+class SampleQualityOut(BaseModel):
+    sample_count: int
+    chain_count: int = Field(..., description="按 max_gap_seconds 切分出的连续链数量")
+    gaps: list[GapOut] = Field(
+        ..., description="按时间排序且已合并相邻断链的 gap 段"
+    )
+    anomalies: list[SampleAnomalyOut] = Field(
+        ..., description="突变异常样本（按下标升序）；异常点不做静默修正"
+    )
+    query_start: UtcZ
+    query_end: UtcZ
+    uncovered: list[UncoveredOut] = Field(
+        ...,
+        description=(
+            "query 范围内无法插值的区段（含断链与样本覆盖之外），"
+            "按时间排序，说明 query_start/query_end 如何被缺口覆盖"
+        ),
+    )
+    covered_seconds: float = Field(
+        ..., description="query 范围内被连续链覆盖的总时长（秒）"
+    )
+    uncovered_seconds: float = Field(
+        ..., description="query 范围内未覆盖的总时长（秒）"
+    )
+    overall_status: str = Field(
+        ..., description="ok（无异常且 query 完全被覆盖）/ warn（存在异常或覆盖缺口）"
+    )

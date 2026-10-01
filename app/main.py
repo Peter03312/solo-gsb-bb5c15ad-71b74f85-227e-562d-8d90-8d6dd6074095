@@ -18,11 +18,18 @@ from app.schemas import (
     FleetResultOut,
     FleetTaskOut,
     FleetTaskRequest,
+    GapOut,
+    GapQueryOverlapOut,
     ResultOut,
+    SampleAnomalyOut,
+    SampleQualityOut,
+    SampleQualityRequest,
     TaskOut,
+    UncoveredOut,
     WindowRequest,
 )
 from app.services.fleet import FleetShip, compute_fleet_windows
+from app.services.quality import audit_samples
 from app.services.tides import compute_navigation_windows
 
 
@@ -163,6 +170,80 @@ def root() -> RedirectResponse:
 def health(conn: sqlite3.Connection = Depends(get_db)) -> dict:
     conn.execute("SELECT 1")
     return {"status": "ok"}
+
+
+@app.post(
+    "/sample-quality",
+    response_model=SampleQualityOut,
+    tags=["样本审计"],
+    summary="审计潮位样本（断链与突变异常），用于计算通航窗口前的质检",
+)
+def sample_quality(req: SampleQualityRequest) -> SampleQualityOut:
+    """Synchronously audit a batch of samples without persisting anything.
+
+    Samples strictly exceeding ``max_gap_seconds`` apart are reported as
+    (merged) gaps; within every continuous chain, interior knots whose two
+    flanking adjacent slopes are robust-z outliers (median/MAD, |z| >= 3.5)
+    are reported as jump anomalies.  Anomalous samples are returned with
+    their original index/height — they are never corrected or filtered.
+    ``overall_status`` is ``warn`` when anomalies exist or the query range
+    is not fully covered by continuous chains, ``ok`` otherwise.
+    """
+    report = audit_samples(
+        sample_times=[s.time for s in req.samples],
+        sample_heights=[s.height_m for s in req.samples],
+        query_start=req.query_start,
+        query_end=req.query_end,
+        max_gap_seconds=req.max_gap_seconds,
+    )
+    return SampleQualityOut(
+        sample_count=report.sample_count,
+        chain_count=report.chain_count,
+        gaps=[
+            GapOut(
+                start=g.start,
+                end=g.end,
+                duration_seconds=g.duration_seconds,
+                query_overlap=(
+                    GapQueryOverlapOut(
+                        start=g.query_overlap.start,
+                        end=g.query_overlap.end,
+                        duration_seconds=g.query_overlap.duration_seconds,
+                    )
+                    if g.query_overlap is not None
+                    else None
+                ),
+            )
+            for g in report.gaps
+        ],
+        anomalies=[
+            SampleAnomalyOut(
+                index=a.index,
+                time=a.time,
+                height_m=a.height_m,
+                chain_index=a.chain_index,
+                slope_before=a.slope_before,
+                slope_after=a.slope_after,
+                z_before=a.z_before,
+                z_after=a.z_after,
+            )
+            for a in report.anomalies
+        ],
+        query_start=report.query_start,
+        query_end=report.query_end,
+        uncovered=[
+            UncoveredOut(
+                start=u.start,
+                end=u.end,
+                reason=u.reason,
+                duration_seconds=u.duration_seconds,
+            )
+            for u in report.uncovered
+        ],
+        covered_seconds=report.covered_seconds,
+        uncovered_seconds=report.uncovered_seconds,
+        overall_status=report.overall_status,
+    )
 
 
 @app.post(
